@@ -4,10 +4,14 @@ import time
 from typing import Optional, Dict
 import yfinance as yf
 
-# ---------- SAFE QUOTE (rate-limit tolerant) ----------
-def fetch_quote(symbol: str) -> dict:
+# -------- Safe live quote (rate-limit tolerant) --------
+def fetch_quote(symbol: str | None) -> dict | None:
+    if not symbol:
+        return None
     s = (symbol or "").upper().strip()
-    for attempt in range(2):  # brief retry once
+    price = prev = change = pct = None
+    exch, curr = "", "INR"
+    for attempt in range(2):  # one retry
         try:
             t = yf.Ticker(s)
             info = t.fast_info
@@ -16,15 +20,13 @@ def fetch_quote(symbol: str) -> dict:
             change = (price - prev) if (price is not None and prev is not None) else None
             pct = ((change / prev) * 100) if (change is not None and prev and prev != 0) else None
             exch = info.get("exchange", "")
-            curr = info.get("currency", "INR")
+            curr = info.get("currency", "INR") or "INR"
             break
         except Exception:
             if attempt == 0:
                 time.sleep(1.2)
                 continue
-            price = prev = change = pct = None
-            exch, curr = "", "INR"
-
+            # give up; return Nones
     return {
         "symbol": s,
         "price": price,
@@ -42,20 +44,19 @@ def format_change(change: float | None, pct: float | None) -> str:
     arrow = "▲" if change >= 0 else "▼"
     return f"{arrow} {change:.2f} ({pct:.2f}%)"
 
-# ---------- TECHNICALS ----------
+# -------- Basic technicals for a quick “Trend Meter” --------
 def _rsi(series, period: int = 14) -> Optional[float]:
     try:
-        import numpy as np
         import pandas as pd
-        if len(series) < period + 1:
-            return None
         delta = pd.Series(series).diff()
         gains = delta.clip(lower=0)
         losses = -delta.clip(upper=0)
+        if len(gains) < period or len(losses) < period:
+            return None
         avg_gain = gains.rolling(window=period).mean().iloc[-1]
         avg_loss = losses.rolling(window=period).mean().iloc[-1]
-        if avg_gain is None or avg_loss is None or avg_loss == 0:
-            return None if avg_gain is None else 100.0
+        if avg_loss == 0:
+            return 100.0
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
     except Exception:
@@ -70,10 +71,7 @@ def _sma(series, window: int) -> Optional[float]:
     except Exception:
         return None
 
-def trend_meter(symbol: str, period: str = "6mo") -> Dict:
-    """
-    Returns a dict with RSI(14), SMA20/50/200 and a simple label: Bullish / Bearish / Neutral.
-    """
+def trend_meter(symbol: str | None, period: str = "6mo") -> Dict:
     out = {
         "symbol": (symbol or "").upper(),
         "close": None,
@@ -85,6 +83,9 @@ def trend_meter(symbol: str, period: str = "6mo") -> Dict:
         "note": "Insufficient data",
     }
     try:
+        if not symbol:
+            out["note"] = "No symbol"
+            return out
         df = yf.download(symbol, period=period, interval="1d", progress=False, threads=False)
         if df is None or df.empty:
             out["note"] = "No history"
@@ -96,20 +97,14 @@ def trend_meter(symbol: str, period: str = "6mo") -> Dict:
         out["sma50"] = _sma(closes, 50)
         out["sma200"] = _sma(closes, 200)
 
-        c, s20, s50, s200, r = out["close"], out["sma20"], out["sma50"], out["sma200"], out["rsi14"]
-
-        # Simple regime logic
-        if all(x is not None for x in [c, s50, s200, r]):
+        c, s50, s200, r = out["close"], out["sma50"], out["sma200"], out["rsi14"]
+        if all(x is not None for x in [c, s50, s200]):
             if c > s50 > s200 and (r is None or r >= 55):
-                out["label"] = "Bullish"
-                out["note"] = "Price above 50 & 200 SMA; momentum ok"
+                out["label"] = "Bullish"; out["note"] = "Above 50 & 200 SMA; momentum OK"
             elif c < s50 < s200 and (r is None or r <= 45):
-                out["label"] = "Bearish"
-                out["note"] = "Price below 50 & 200 SMA; weak momentum"
+                out["label"] = "Bearish"; out["note"] = "Below 50 & 200 SMA; weak momentum"
             else:
-                out["label"] = "Neutral"
-                out["note"] = "Mixed signals / range"
-
+                out["label"] = "Neutral"; out["note"] = "Mixed signals / range"
         return out
     except Exception:
         return out
